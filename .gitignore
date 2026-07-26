@@ -1,0 +1,27 @@
+# Dependencies
+tauri-app/node_modules/
+
+# Build outputs
+tauri-app/dist/
+tauri-app/src-tauri/target/
+
+# Runtime data
+data/
+*.db
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Demo assets (not part of the application)
+intro-assets/
+lottery-intro-*.html
+v7-s01.png
+
+# Temporary files
+*.tmp
+*.log
