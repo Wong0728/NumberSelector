@@ -1,5 +1,5 @@
 {
-  "name": "number-selector-tauri",
+  "name": "NumberSelector",
   "private": true,
   "version": "0.1.0",
   "type": "module",

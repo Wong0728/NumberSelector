@@ -1,6 +1,6 @@
-# 智能抽号系统
+# NumberSelector
 
-基于 Tauri 2.x 构建的跨平台桌面抽号应用，采用 React 18 前端 + Rust 后端架构。
+智能抽号系统 —— 基于 Tauri 2.x 构建的跨平台桌面抽号应用，采用 React 18 前端 + Rust 后端架构。
 
 ## 功能特性
 

@@ -1,3 +1,3 @@
 [build]
 # 中文路径下，把 target 放到 %LOCALAPPDATA% 避免 quote build-script panic
-target-dir = "C:/Users/WongJY/AppData/Local/NumberSelectorTauri/target"
+target-dir = "C:/Users/WongJY/AppData/Local/NumberSelector/target"

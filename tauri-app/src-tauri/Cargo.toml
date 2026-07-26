@@ -1,12 +1,12 @@
 [package]
-name = "number-selector-tauri"
+name = "number_selector"
 version = "0.1.0"
-description = "智能抽号系统 Tauri 版"
+description = "NumberSelector - 智能抽号系统"
 authors = ["WongJY"]
 edition = "2021"
 
 [lib]
-name = "number_selector_tauri_lib"
+name = "number_selector_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]

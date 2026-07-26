@@ -5,7 +5,7 @@ use windows::core::{w, PCWSTR};
 use windows::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONERROR, MB_OK};
 
 fn main() {
-    if let Err(e) = number_selector_tauri_lib::run() {
+    if let Err(e) = number_selector_lib::run() {
         show_error(&e);
         std::process::exit(1);
     }

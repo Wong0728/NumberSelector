@@ -25,3 +25,6 @@ v7-s01.png
 # Temporary files
 *.tmp
 *.log
+
+# Archives (used for releases, not source)
+tauri-app/*.zip
