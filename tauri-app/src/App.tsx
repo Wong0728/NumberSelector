@@ -83,6 +83,8 @@ function MainApp() {
 
   const [inBreak, setInBreak] = useState(false);
   const [verified, setVerified] = useState(false);
+  // 禁用时段内免 U 盘验证可用的模式（back 名称）
+  const [breakAllow, setBreakAllow] = useState<string[]>(["Mode5"]);
   const [usbVerifyOpen, setUsbVerifyOpen] = useState(false);
   const [usbVerifyScope, setUsbVerifyScope] = useState<"current_break" | "permanent">("current_break");
 
@@ -139,7 +141,7 @@ function MainApp() {
     let cancelled = false;
     (async () => {
       try {
-        const [m, mem, st, ib, scope, nl, ql, frd, df] = await Promise.all([
+        const [m, mem, st, ib, scope, nl, ql, frd, df, bam] = await Promise.all([
           api.getModes(),
           api.getMemoryModes(),
           api.getStudents(),
@@ -149,12 +151,14 @@ function MainApp() {
           api.getQuantityLimits(),
           api.getFirstRunDone("draw"),
           api.getDisplayFormat(),
+          api.getBreakAllowModes().catch(() => ["Mode5"] as string[]),
         ]);
         if (cancelled) return;
         setModes(m);
         setMemoryModes(new Set(mem));
         setStudents(st);
         setInBreak(ib);
+        setBreakAllow(bam);
         setUsbVerifyScope(scope === "permanent" ? "permanent" : "current_break");
         setNumberLimits(nl);
         setQuantityLimits(ql);
@@ -188,12 +192,12 @@ function MainApp() {
   // 监听主窗口最小化 → 显示悬浮窗，并保存窗口状态
   useWindowState("draw", () => { invoke("main_minimize_to_float"); });
 
-  // 处于禁用时段且未验证时，若当前选中的非 Mode5 模式应被自动取消
+  // 处于禁用时段且未验证时，若当前选中的非免验证模式应被自动取消
   useEffect(() => {
-    if (inBreak && !verified && backMode && backMode !== MODE5_BACK) {
+    if (inBreak && !verified && backMode && !breakAllow.includes(backMode)) {
       setBackMode(null);
     }
-  }, [inBreak, verified, backMode]);
+  }, [inBreak, verified, backMode, breakAllow]);
 
   // 点击右下角「更多」菜单外部或按 Esc 关闭
   useEffect(() => {
@@ -214,9 +218,20 @@ function MainApp() {
     };
   }, [moreMenuOpen]);
 
-  // 模式禁用判断（禁用时段内模式 1-4 需要 U 盘验证）
+  // 模式禁用判断（禁用时段内非免验证模式需要 U 盘验证）
   const isModeLocked = (backName: string) =>
-    inBreak && !verified && backName !== MODE5_BACK;
+    inBreak && !verified && !breakAllow.includes(backName);
+
+  // 禁用时段内免验证模式的中文名（状态条与提示文案用）
+  const breakAllowNames = useMemo(() => {
+    if (!modes) return [];
+    const names: string[] = [];
+    modes.front.forEach((front, i) => {
+      if (breakAllow.includes(modes.back[i])) names.push(front);
+    });
+    if (breakAllow.includes(MODE5_BACK)) names.push(modes.mode5_front);
+    return names;
+  }, [modes, breakAllow]);
 
   function handleModeClick(back: string) {
     if (drawing) return;
@@ -256,7 +271,7 @@ function MainApp() {
       {
         selector: "mode-select",
         title: "选择模式",
-        content: "点击要使用的模式。禁用时段内模式 1-4 需先验证 U 盘，模式五始终可用。",
+        content: "点击要使用的模式。禁用时段内未开放的模式需先验证 U 盘。",
       },
       {
         selector: "input-area",
@@ -517,7 +532,7 @@ function MainApp() {
       if (ok) {
         setVerified(true);
         setUsbVerifyOpen(false);
-        showToast("U盘验证通过，当前禁用时段内模式 1-4 可用", "success");
+        showToast("U盘验证通过，当前禁用时段内全部模式可用", "success");
       } else {
         showToast("验证失败：未检测到授权U盘", "error");
       }
@@ -680,9 +695,10 @@ function MainApp() {
           );
         })}
         <button
-          className={`chip${backMode === MODE5_BACK ? " selected" : ""}`}
+          className={`chip${backMode === MODE5_BACK ? " selected" : ""}${isModeLocked(MODE5_BACK) ? " locked" : ""}`}
           disabled={drawing}
           onClick={() => handleModeClick(MODE5_BACK)}
+          title={isModeLocked(MODE5_BACK) ? "点击进行U盘验证" : ""}
         >
           {modes.mode5_front}
         </button>
@@ -772,7 +788,9 @@ function MainApp() {
           {inBreak
             ? verified
               ? "当前为禁用时段，已通过U盘验证"
-              : "当前为禁用时段（仅模式五可用）"
+              : breakAllowNames.length > 0
+                ? `当前为禁用时段（仅${breakAllowNames.join("、")}可用）`
+                : "当前为禁用时段（需U盘验证）"
             : "可正常抽号"}
         </span>
         <span className="pill">
@@ -796,7 +814,7 @@ function MainApp() {
           <div className="dialog" onClick={(e) => e.stopPropagation()}>
             <div className="dialog-title">禁用时段验证</div>
             <div className="dialog-message">
-              当前为禁用时段，使用模式 1-4 需要插入并验证已注册的授权U盘。
+              当前为禁用时段，使用未开放的模式需要插入并验证已注册的授权U盘。
               <br />
               验证有效期：{usbVerifyScope === "permanent" ? "程序运行期间一直有效" : "仅当前禁用时段有效"}
             </div>

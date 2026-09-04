@@ -196,6 +196,68 @@ pub fn set_memory_mode(back_mode: &str, memory: bool) {
 }
 
 // ═══════════════════════════════════════════════
+//  禁用时段可用模式（免 U 盘验证）
+// ═══════════════════════════════════════════════
+
+fn valid_mode_names() -> std::collections::HashSet<String> {
+    DEFAULT_BACK_1TO4
+        .iter()
+        .map(|s| s.to_string())
+        .chain(std::iter::once(MODE5_BACK.to_string()))
+        .collect()
+}
+
+/// 读取禁用时段内免 U 盘验证可用的模式（back 名称列表）。
+/// 默认仅 Mode5，保持历史行为。
+pub fn get_break_allow_modes() -> Vec<String> {
+    let valid = valid_mode_names();
+    if let Some(v) = db::get_setting("break_allow_modes") {
+        return v
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty() && valid.contains(s))
+            .collect();
+    }
+    vec![MODE5_BACK.to_string()]
+}
+
+/// 保存禁用时段内可用模式（空列表 = 时段内所有模式均需验证）
+pub fn save_break_allow_modes(modes: &[String]) -> Result<(), String> {
+    let valid = valid_mode_names();
+    let mut cleaned: Vec<String> = modes
+        .iter()
+        .filter(|m| valid.contains(m.as_str()))
+        .cloned()
+        .collect();
+    cleaned.sort();
+    cleaned.dedup();
+    db::set_setting("break_allow_modes", &cleaned.join(","));
+    Ok(())
+}
+
+/// 当前模式下是否免 U 盘验证
+pub fn is_break_allowed(back_mode: &str) -> bool {
+    get_break_allow_modes().iter().any(|m| m == back_mode)
+}
+
+/// 禁用时段内可用模式的中文名列表（用于提示文案，如「模式三、模式五」）
+pub fn break_allow_front_names() -> Vec<String> {
+    let allowed = get_break_allow_modes();
+    let modes = data::load_modes();
+    let mut names: Vec<String> = modes
+        .front
+        .iter()
+        .zip(modes.back.iter())
+        .filter(|(_, b)| allowed.contains(b))
+        .map(|(f, _)| f.clone())
+        .collect();
+    if allowed.iter().any(|m| m == MODE5_BACK) {
+        names.push(modes.mode5_front);
+    }
+    names
+}
+
+// ═══════════════════════════════════════════════
 //  时间段设置
 // ═══════════════════════════════════════════════
 
@@ -996,6 +1058,58 @@ fn normalize_gender(s: &str) -> Option<&'static str> {
         "男" | "男生" | "m" | "male" | "boy" | "1" => Some("boy"),
         "女" | "女生" | "f" | "female" | "girl" | "0" => Some("girl"),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn init_test_db() {
+        let dir = std::env::temp_dir().join(format!("ns_test_break_allow_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("NS_DATA_DIR", &dir);
+        db::init_databases().expect("init test db failed");
+    }
+
+    #[test]
+    fn break_allow_modes_roundtrip() {
+        init_test_db();
+
+        // 未配置时默认仅 Mode5
+        assert_eq!(get_break_allow_modes(), vec!["Mode5".to_string()]);
+        assert!(is_break_allowed("Mode5"));
+        assert!(!is_break_allowed("Mode1"));
+
+        // 非法名称被过滤，输出排序去重
+        save_break_allow_modes(&[
+            "Mode5".to_string(),
+            "Mode1".to_string(),
+            "NoSuchMode".to_string(),
+            "Mode1".to_string(),
+        ])
+        .unwrap();
+        assert_eq!(
+            get_break_allow_modes(),
+            vec!["Mode1".to_string(), "Mode5".to_string()]
+        );
+
+        // 中文名列表与保存的模式对应
+        let names = break_allow_front_names();
+        assert_eq!(names.len(), 2);
+        assert!(names.contains(&"模式一".to_string()));
+        assert!(names.contains(&"模式五".to_string()));
+
+        // 允许为空：禁用时段内全部模式需验证
+        save_break_allow_modes(&[]).unwrap();
+        assert!(get_break_allow_modes().is_empty());
+        assert!(!is_break_allowed("Mode5"));
+        assert!(break_allow_front_names().is_empty());
+
+        // 恢复默认
+        save_break_allow_modes(&["Mode5".to_string()]).unwrap();
+        assert!(is_break_allowed("Mode5"));
     }
 }
 

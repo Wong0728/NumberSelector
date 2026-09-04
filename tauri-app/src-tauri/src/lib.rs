@@ -9,12 +9,17 @@ mod float_window;
 mod lock;
 mod settings;
 mod startup;
+mod webview2;
 
 use commands::*;
 use tauri::{LogicalPosition, LogicalSize, Manager};
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() -> Result<(), String> {
+    // WebView2 运行时保障：优先系统，其次 exe 同级 WebView2Runtime\，
+    // 都没有时弹出原生引导（下载官方安装引导器 / 提示放置固定版本运行时）。
+    webview2::ensure_runtime();
+
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
@@ -148,6 +153,8 @@ pub fn run() -> Result<(), String> {
             get_seat_direction,
             save_seat_direction,
             save_modes,
+            get_break_allow_modes,
+            save_break_allow_modes,
             // ── 悬浮窗管理 ──
             close_float_window,
             ensure_float_window,

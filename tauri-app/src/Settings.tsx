@@ -31,6 +31,8 @@ export default function SettingsApp() {
   const [modes, setModes] = useState<ModesPayload | null>(null);
   const [memoryStatuses, setMemoryStatuses] = useState<MemoryModeStatus[]>([]);
   const [timeRanges, setTimeRanges] = useState<TimeRange[]>([]);
+  // 禁用时段内免 U 盘验证可用的模式（back 名称）
+  const [breakAllowModes, setBreakAllowModes] = useState<string[]>(["Mode5"]);
   const [ahenConfig, setAhenConfig] = useState<AhenConfig | null>(null);
   const [seatDirection, setSeatDirection] = useState<SeatDirection>("rtl");
   const [usbVerifyScope, setUsbVerifyScope] = useState<UsbVerifyScope>("current_break");
@@ -141,7 +143,7 @@ export default function SettingsApp() {
     setSettingsLoading(true);
     const errors: string[] = [];
 
-    const [m, mem, tr, ah, dir, scope, nl, ql, frd, df, ed, ddi] = await Promise.all([
+    const [m, mem, tr, ah, dir, scope, nl, ql, frd, df, ed, ddi, bam] = await Promise.all([
       api.getModes().catch(e => { errors.push(`模式: ${e}`); return null; }),
       api.getMemoryModeStatuses().catch(e => { errors.push(`内存模式: ${e}`); return [] as MemoryModeStatus[]; }),
       api.getTimeRanges().catch(e => { errors.push(`时间设置: ${e}`); return [] as TimeRange[]; }),
@@ -154,6 +156,7 @@ export default function SettingsApp() {
       api.getDisplayFormat().catch(e => { errors.push(`显示格式: ${e}`); return "number_name" as const; }),
       api.getRecordExpireDays().catch(e => { errors.push(`记录过期: ${e}`); return 0; }),
       api.getDataDirInfo().catch(e => { errors.push(`数据目录: ${e}`); return null; }),
+      api.getBreakAllowModes().catch(e => { errors.push(`禁用时段可用模式: ${e}`); return ["Mode5"] as string[]; }),
     ]);
 
     if (errors.length > 0) {
@@ -167,6 +170,7 @@ export default function SettingsApp() {
 
     setMemoryStatuses(mem);
     setTimeRanges(tr);
+    setBreakAllowModes(bam);
     setEditingRanges(tr.map(r => ({ ...r })));
     setRangeRawInputs({});
     setRangeInputErrors({});
@@ -221,6 +225,26 @@ export default function SettingsApp() {
       await api.saveDisplayFormat(fmt);
       showToast("显示格式已保存", "success");
     } catch (e) {
+      showToast(`保存失败: ${e}`, "error");
+    }
+  }
+
+  async function handleToggleBreakAllow(back: string) {
+    const prev = breakAllowModes;
+    const next = prev.includes(back)
+      ? prev.filter(m => m !== back)
+      : [...prev, back];
+    setBreakAllowModes(next);
+    try {
+      await api.saveBreakAllowModes(next);
+      showToast(
+        next.length
+          ? "禁用时段可用模式已保存"
+          : "已保存：禁用时段内所有模式均需验证U盘",
+        "success"
+      );
+    } catch (e) {
+      setBreakAllowModes(prev);
       showToast(`保存失败: ${e}`, "error");
     }
   }
@@ -1040,13 +1064,13 @@ export default function SettingsApp() {
     {
       selector: "time-ranges",
       title: "设置禁用时段",
-      content: "添加课间等禁用时段，该时段内仅模式五可直接抽号。",
+      content: "添加课间等禁用时段，该时段内仅勾选的「免验证模式」可直接抽号。",
       centered: true,
     },
     {
       selector: "usb-settings",
       title: "授权 U 盘",
-      content: "注册 U 盘后，禁用时段内可验证使用模式 1-4。也可后续再设置。",
+      content: "注册 U 盘后，禁用时段内可验证解锁全部模式。也可后续再设置。",
     },
     {
       selector: "seat-direction",
@@ -1335,7 +1359,21 @@ export default function SettingsApp() {
         {/* 下课时间 */}
         <div className="card settings-card" data-tour="time-ranges">
           <h3 className="settings-card-title">下课时间</h3>
-          <p className="settings-card-desc">禁用时段内仅模式五可抽号</p>
+          <p className="settings-card-desc">禁用时段内仅勾选的「免验证模式」可直接抽号，其余模式需验证U盘</p>
+
+          <div className="settings-row settings-row-mb-sm">
+            <span className="settings-lbl">免验证模式</span>
+            {allModes.map(m => (
+              <label key={m.back} className="settings-cb">
+                <input
+                  type="checkbox"
+                  checked={breakAllowModes.includes(m.back)}
+                  onChange={() => handleToggleBreakAllow(m.back)}
+                />
+                <span>{m.front}</span>
+              </label>
+            ))}
+          </div>
 
           {editingRanges.map((r, i) => (
             <div key={i} className="settings-row settings-row-mb-sm">

@@ -4,6 +4,7 @@ tauri-app/node_modules/
 # Build outputs
 tauri-app/dist/
 tauri-app/src-tauri/target/
+release/
 
 # Runtime data
 data/
@@ -20,6 +21,7 @@ Thumbs.db
 # Demo assets (not part of the application)
 intro-assets/
 lottery-intro-*.html
+lottery-intro-*.mp4
 v7-s01.png
 
 # Temporary files

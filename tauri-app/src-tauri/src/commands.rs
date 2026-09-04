@@ -79,10 +79,17 @@ pub fn start_draw(
     if !((ql.min..=ql.max).contains(&(qty as i64))) {
         return Err(format!("抽号数量必须在 {}-{} 之间", ql.min, ql.max));
     }
-    // 禁用时段内非 Mode5 模式需 U盘验证
+    // 禁用时段内未开放的模式需 U盘验证
     let in_break = data::is_in_forbid_range();
-    if back_mode != config::MODE5_BACK && in_break && !settings::is_usb_session_valid(in_break) {
-        return Err("当前为禁用时段，请先验证U盘或使用模式五".to_string());
+    if in_break && !settings::is_break_allowed(&back_mode) && !settings::is_usb_session_valid(in_break)
+    {
+        let allowed = settings::break_allow_front_names();
+        let hint = if allowed.is_empty() {
+            "当前为禁用时段，请先验证U盘".to_string()
+        } else {
+            format!("当前为禁用时段，请先验证U盘或使用{}", allowed.join("、"))
+        };
+        return Err(hint);
     }
     let students = data::load_students();
     let mut boys: HashSet<i32> = HashSet::new();
@@ -218,6 +225,19 @@ pub fn set_memory_mode(back_mode: String, enabled: bool) -> Result<(), String> {
     lock::check_other_session(StartupMode::current())?;
     settings::set_memory_mode(&back_mode, enabled);
     Ok(())
+}
+
+// ─────────── 禁用时段可用模式 ───────────
+
+#[tauri::command]
+pub fn get_break_allow_modes() -> Vec<String> {
+    settings::get_break_allow_modes()
+}
+
+#[tauri::command]
+pub fn save_break_allow_modes(modes: Vec<String>) -> Result<(), String> {
+    lock::check_other_session(StartupMode::current())?;
+    settings::save_break_allow_modes(&modes)
 }
 
 // ─────────── 时间段设置 ───────────

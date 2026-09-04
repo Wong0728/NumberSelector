@@ -135,7 +135,7 @@ export const api = {
     invoke<void>("reset_memory_mode", { backMode: back_mode }),
   usbValid: () => invoke<boolean>("usb_valid"),
 
-  // ── U盘会话验证（禁用时段内模式 1-4） ──
+  // ── U盘会话验证（禁用时段内受限模式） ──
   verifyUsbForSession: (scope: UsbVerifyScope) =>
     invoke<boolean>("verify_usb_for_session", { scope }),
   isUsbSessionVerified: () => invoke<boolean>("is_usb_session_verified"),
@@ -190,6 +190,11 @@ export const api = {
   // ── 设置 - 模式名 ──
   saveModes: (front_names: string[]) =>
     invoke<void>("save_modes", { frontNames: front_names }),
+
+  // ── 设置 - 禁用时段可用模式 ──
+  getBreakAllowModes: () => invoke<string[]>("get_break_allow_modes"),
+  saveBreakAllowModes: (modes: string[]) =>
+    invoke<void>("save_break_allow_modes", { modes }),
 
   // ── 设置 - 抽号参数范围 ──
   getNumberLimits: () => invoke<NumberLimits>("get_number_limits"),
