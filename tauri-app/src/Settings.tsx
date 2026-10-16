@@ -1232,7 +1232,7 @@ export default function SettingsApp() {
             <p className="settings-gate-message error" style={{ marginBottom: 12 }}>
               {settingsLoadError || "设置加载失败，请检查程序状态后重试。"}
             </p>
-            <button className="settings-btn primary" onClick={loadAllSettings}>
+            <button className="settings-btn primary" onClick={loadAllSettings} disabled={settingsLoading}>
               重新加载设置
             </button>
           </div>
@@ -1256,6 +1256,7 @@ export default function SettingsApp() {
           <button
             className="settings-btn secondary"
             onClick={loadAllSettings}
+            disabled={settingsLoading}
             style={{ marginTop: 10 }}
           >
             重新加载设置

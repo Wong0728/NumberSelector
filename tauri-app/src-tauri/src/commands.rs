@@ -37,6 +37,12 @@ pub fn get_modes() -> ModesPayload {
     data::load_modes()
 }
 
+/// 前端日志写入 <数据目录>/app.log（排查用）。level: debug/info/warn/error
+#[tauri::command]
+pub fn log_event(level: String, category: String, message: String) {
+    crate::logging::log_with_level(&level, &category, &message);
+}
+
 #[tauri::command]
 pub fn get_memory_modes() -> Vec<String> {
     let mut v: Vec<String> = data::load_memory_modes().into_iter().collect();
@@ -47,6 +53,13 @@ pub fn get_memory_modes() -> Vec<String> {
 #[tauri::command]
 pub fn get_students() -> Vec<Student> {
     data::load_students()
+}
+
+/// 数据版本号：名单/内存模式/参数范围/模式名等被修改时递增。
+/// 抽号端（独立进程）轮询该值，变化时重新拉取数据，避免跨进程数据陈旧。
+#[tauri::command]
+pub fn get_data_version() -> u64 {
+    db::get_data_version()
 }
 
 #[tauri::command]
@@ -71,12 +84,21 @@ pub fn start_draw(
 ) -> Result<DrawResult, String> {
     lock::check_other_session(StartupMode::current())?;
 
+    // gender 只接受 boy/girl/null，其他值一律拒绝，避免静默落入女生号码池
+    if let Some(g) = &gender {
+        if g != "boy" && g != "girl" {
+            return Err("gender 参数无效（仅支持 boy/girl）".to_string());
+        }
+    }
+
     let nl = settings::get_number_limits();
     let ql = settings::get_quantity_limits();
     if !((nl.min..=nl.max).contains(&(max_num as i64))) {
+        crate::logging::log_event("draw", &format!("抽号被拒绝: 最大号码 {} 超出范围 {}-{}", max_num, nl.min, nl.max));
         return Err(format!("最大号码必须在 {}-{} 之间", nl.min, nl.max));
     }
     if !((ql.min..=ql.max).contains(&(qty as i64))) {
+        crate::logging::log_event("draw", &format!("抽号被拒绝: 数量 {} 超出范围 {}-{}", qty, ql.min, ql.max));
         return Err(format!("抽号数量必须在 {}-{} 之间", ql.min, ql.max));
     }
     // 禁用时段内未开放的模式需 U盘验证
@@ -89,6 +111,7 @@ pub fn start_draw(
         } else {
             format!("当前为禁用时段，请先验证U盘或使用{}", allowed.join("、"))
         };
+        crate::logging::log_event("draw", &format!("抽号被拒绝: 禁用时段 mode={} 未验证U盘", back_mode));
         return Err(hint);
     }
     let students = data::load_students();
@@ -102,7 +125,7 @@ pub fn start_draw(
         }
     }
     let ahen = settings::get_ahen_config();
-    Ok(perform_draw(
+    let result = perform_draw(
         &back_mode,
         max_num,
         qty,
@@ -112,19 +135,33 @@ pub fn start_draw(
         save,
         &ahen,
         in_break,
-    ))
+    );
+    crate::logging::log_event(
+        "draw",
+        &format!(
+            "抽号结果 mode={} picked={:?} actual_qty={} all_used={} message={:?}",
+            back_mode, result.picked, result.actual_qty, result.all_used, result.message
+        ),
+    );
+    Ok(result)
 }
 
 #[tauri::command]
 pub fn clear_record(back_mode: String) -> Result<(), String> {
     lock::check_other_session(StartupMode::current())?;
+    crate::logging::log_event("draw", &format!("清空记录 mode={}", back_mode));
     data::clear_record(&back_mode);
+    db::bump_data_version();
     Ok(())
 }
 
 #[tauri::command]
-pub fn reset_memory_mode(back_mode: String) {
+pub fn reset_memory_mode(back_mode: String) -> Result<(), String> {
+    lock::check_other_session(StartupMode::current())?;
+    crate::logging::log_event("draw", &format!("重置内存模式记录 mode={}", back_mode));
     data::reset_memory_mode(&back_mode);
+    db::bump_data_version();
+    Ok(())
 }
 
 /// U 盘验证 - 使用卷序列号 + SHA256 哈希验证
@@ -189,7 +226,9 @@ pub fn verify_usb_for_session(scope: String) -> bool {
         "permanent" => UsbVerifyScope::Permanent,
         _ => UsbVerifyScope::CurrentBreak,
     };
-    settings::verify_usb_session(scope)
+    let ok = settings::verify_usb_session(scope);
+    crate::logging::log_event("usb", &format!("U盘会话验证 scope={:?} 结果={}", scope, ok));
+    ok
 }
 
 /// 判断当前 U盘会话验证是否仍有效
@@ -224,6 +263,7 @@ pub fn get_memory_mode_statuses() -> Vec<MemoryModeStatus> {
 pub fn set_memory_mode(back_mode: String, enabled: bool) -> Result<(), String> {
     lock::check_other_session(StartupMode::current())?;
     settings::set_memory_mode(&back_mode, enabled);
+    db::bump_data_version();
     Ok(())
 }
 
@@ -297,9 +337,14 @@ pub fn save_modes(front_names: Vec<String>) -> Result<(), String> {
         if name.trim().is_empty() {
             return Err("模式名称不能为空".to_string());
         }
+        // 模式名以逗号分隔持久化，含逗号/换行会导致读取端解析错位
+        if name.contains(',') || name.contains('，') || name.contains('\n') || name.contains('\r') {
+            return Err("模式名称不能包含逗号或换行".to_string());
+        }
     }
     lock::check_other_session(StartupMode::current())?;
     db::set_setting("modes_front", &front_names.join(","));
+    db::bump_data_version();
     Ok(())
 }
 
@@ -314,6 +359,7 @@ pub fn load_seatmap() -> Option<String> {
 pub fn save_seatmap(seatmap_json: String) -> Result<(), String> {
     lock::check_other_session(StartupMode::current())?;
     data::save_seatmap(&seatmap_json);
+    db::bump_data_version();
     Ok(())
 }
 
@@ -332,8 +378,39 @@ pub fn advanced_draw_v2(req: AdvancedDrawRequest) -> Result<AdvancedDrawResult, 
     let students = data::load_students();
     let direction = settings::get_seat_direction();
     let ahen = settings::get_ahen_config();
+    // 禁用时段内未开放的模式需 U盘验证（与 start_draw 同一套管控，防止高级抽号绕过）
     let in_break = data::is_in_forbid_range();
-    advanced_perform_draw_v2(&req, &seatmap_json, &students, &direction, &ahen, in_break)
+    if in_break
+        && !settings::is_break_allowed(&req.back_mode)
+        && !settings::is_usb_session_valid(in_break)
+    {
+        let allowed = settings::break_allow_front_names();
+        let hint = if allowed.is_empty() {
+            "当前为禁用时段，请先验证U盘".to_string()
+        } else {
+            format!("当前为禁用时段，请先验证U盘或使用{}", allowed.join("、"))
+        };
+        crate::logging::log_event(
+            "draw",
+            &format!("高级抽号被拒绝: 禁用时段 mode={} 未验证U盘", req.back_mode),
+        );
+        return Err(hint);
+    }
+    let result = advanced_perform_draw_v2(&req, &seatmap_json, &students, &direction, &ahen, in_break);
+    match &result {
+        Ok(r) => crate::logging::log_event(
+            "draw",
+            &format!(
+                "高级抽号结果 mode={} type={} picked={:?} all_used={}",
+                req.back_mode, req.draw_type, r.picked, r.all_used
+            ),
+        ),
+        Err(e) => crate::logging::log_event(
+            "draw",
+            &format!("高级抽号失败 mode={} type={}: {}", req.back_mode, req.draw_type, e),
+        ),
+    }
+    result
 }
 
 #[tauri::command]
@@ -345,6 +422,14 @@ pub fn check_students_exist() -> bool {
 /// 读取本地文本文件（用于导入座位表 JSON）
 #[tauri::command]
 pub fn read_text_file(path: String) -> Result<String, String> {
+    const MAX_TEXT_FILE_BYTES: u64 = 20 * 1024 * 1024;
+    let meta = std::fs::metadata(&path).map_err(|e| format!("读取文件失败: {}", e))?;
+    if meta.len() > MAX_TEXT_FILE_BYTES {
+        return Err(format!(
+            "文件过大（{} 字节，上限 20MB）",
+            meta.len()
+        ));
+    }
     std::fs::read_to_string(&path).map_err(|e| format!("读取文件失败: {}", e))
 }
 
@@ -369,22 +454,24 @@ pub fn get_startup_view() -> String {
 }
 
 // ─────────── 悬浮窗管理（原生 Win32 实现） ───────────
+// 注意：以下命令涉及 condvar 等待/窗口创建（最长 5 秒），必须保持 async，
+// 否则会在 Tauri 主线程执行并卡住整个 UI。
 
 /// 关闭已存在的悬浮窗（若有），保证全局唯一
 #[tauri::command]
-pub fn close_float_window() {
+pub async fn close_float_window() {
     float_window::close_float_window();
 }
 
 /// 创建/重建悬浮窗：先销毁已有实例，再创建一个新的，确保全局只有一个悬浮窗。
 #[tauri::command]
-pub fn ensure_float_window() -> Result<(), String> {
+pub async fn ensure_float_window() -> Result<(), String> {
     float_window::show_float_window()
 }
 
 /// 关闭悬浮窗并将主窗口前置激活
 #[tauri::command]
-pub fn show_main_window(app: AppHandle) -> Result<(), String> {
+pub async fn show_main_window(app: AppHandle) -> Result<(), String> {
     float_window::close_float_window();
     if let Some(adv) = app.get_webview_window(ADVANCED_LABEL) {
         let _ = adv.hide();
@@ -399,7 +486,7 @@ pub fn show_main_window(app: AppHandle) -> Result<(), String> {
 
 /// 高级抽号窗口最小化：隐藏自身并显示悬浮窗
 #[tauri::command]
-pub fn advanced_minimize_to_float(app: AppHandle) -> Result<(), String> {
+pub async fn advanced_minimize_to_float(app: AppHandle) -> Result<(), String> {
     if let Some(adv) = app.get_webview_window(ADVANCED_LABEL) {
         let _ = adv.hide();
     }
@@ -408,7 +495,7 @@ pub fn advanced_minimize_to_float(app: AppHandle) -> Result<(), String> {
 
 /// 主窗口最小化时显示悬浮窗
 #[tauri::command]
-pub fn main_minimize_to_float() -> Result<(), String> {
+pub async fn main_minimize_to_float() -> Result<(), String> {
     float_window::show_float_window()
 }
 
@@ -422,7 +509,9 @@ pub fn get_number_limits() -> NumberLimits {
 #[tauri::command]
 pub fn save_number_limits(min: i64, max: i64) -> Result<(), String> {
     lock::check_other_session(StartupMode::current())?;
-    settings::save_number_limits(min, max)
+    settings::save_number_limits(min, max)?;
+    db::bump_data_version();
+    Ok(())
 }
 
 #[tauri::command]
@@ -433,14 +522,17 @@ pub fn get_quantity_limits() -> QuantityLimits {
 #[tauri::command]
 pub fn save_quantity_limits(min: i64, max: i64) -> Result<(), String> {
     lock::check_other_session(StartupMode::current())?;
-    settings::save_quantity_limits(min, max)
+    settings::save_quantity_limits(min, max)?;
+    db::bump_data_version();
+    Ok(())
 }
 
 // ─────────── 名单导入 ───────────
 
 /// 解析名单文件（CSV/Excel），返回按性别分组结果（不写盘）
+/// Excel 解析耗时较长，async 化避免阻塞 UI 主线程
 #[tauri::command]
-pub fn parse_students_file(path: String) -> Result<ParsedStudents, String> {
+pub async fn parse_students_file(path: String) -> Result<ParsedStudents, String> {
     settings::parse_students_file(&path)
 }
 
@@ -451,7 +543,9 @@ pub fn overwrite_students(
     girls: Vec<db::StudentRecord>,
 ) -> Result<(), String> {
     lock::check_other_session(StartupMode::current())?;
-    settings::overwrite_students(boys, girls)
+    settings::overwrite_students(boys, girls)?;
+    db::bump_data_version();
+    Ok(())
 }
 
 // ─────────── 多套名单管理 ───────────
@@ -466,53 +560,69 @@ pub fn get_rosters_info() -> (Vec<String>, String) {
 #[tauri::command]
 pub fn create_roster(name: String) -> Result<(), String> {
     lock::check_other_session(StartupMode::current())?;
-    settings::create_roster(&name)
+    settings::create_roster(&name)?;
+    db::bump_data_version();
+    Ok(())
 }
 
 /// 切换活跃名单
 #[tauri::command]
 pub fn switch_roster(name: String) -> Result<(), String> {
     lock::check_other_session(StartupMode::current())?;
-    settings::switch_roster(&name)
+    settings::switch_roster(&name)?;
+    db::bump_data_version();
+    Ok(())
 }
 
 /// 重命名名单
 #[tauri::command]
 pub fn rename_roster(old_name: String, new_name: String) -> Result<(), String> {
     lock::check_other_session(StartupMode::current())?;
-    settings::rename_roster(&old_name, &new_name)
+    settings::rename_roster(&old_name, &new_name)?;
+    db::bump_data_version();
+    Ok(())
 }
 
 /// 删除名单
 #[tauri::command]
 pub fn delete_roster(name: String) -> Result<(), String> {
     lock::check_other_session(StartupMode::current())?;
-    settings::delete_roster(&name)
+    settings::delete_roster(&name)?;
+    db::bump_data_version();
+    Ok(())
 }
 
 /// 复制名单
 #[tauri::command]
 pub fn duplicate_roster(src: String, dst: String) -> Result<(), String> {
     lock::check_other_session(StartupMode::current())?;
-    settings::duplicate_roster(&src, &dst)
+    settings::duplicate_roster(&src, &dst)?;
+    db::bump_data_version();
+    Ok(())
 }
 
 // ─────────── 数据迁移 ───────────
+// 导出/导入涉及整库读写和文件 IO，async 化避免阻塞 UI 主线程
 
 #[tauri::command]
-pub fn export_data(items: Vec<String>, path: String) -> Result<(), String> {
+pub async fn export_data(items: Vec<String>, path: String) -> Result<(), String> {
+    lock::check_other_session(StartupMode::current())?;
     settings::export_data(&items, &path)
 }
 
 #[tauri::command]
-pub fn import_data_preview(path: String) -> Result<ImportPreview, String> {
+pub async fn import_data_preview(path: String) -> Result<ImportPreview, String> {
     settings::import_data_preview(&path)
 }
 
 #[tauri::command]
-pub fn import_data_apply(items: Vec<String>, path: String) -> Result<(), String> {
+pub async fn import_data_apply(items: Vec<String>, path: String) -> Result<(), String> {
     lock::check_other_session(StartupMode::current())?;
-    settings::import_data_apply(&items, &path)
+    let result = settings::import_data_apply(&items, &path);
+    if result.is_ok() {
+        db::bump_data_version();
+    }
+    result
 }
 
 // ─────────── 引导与跨程序切换 ───────────
@@ -528,6 +638,9 @@ pub fn get_first_run_done(scope: String) -> bool {
 /// 标记指定范围的首次引导已完成
 #[tauri::command]
 pub fn set_first_run_done(scope: String) {
+    if lock::check_other_session(StartupMode::current()).is_err() {
+        return; // 对端程序运行时跳过写入，避免跨进程覆盖
+    }
     db::set_setting(&format!("first_run_{}_done", scope), "1");
 }
 
@@ -608,9 +721,12 @@ pub fn get_window_state(scope: String) -> Option<WindowState> {
         .and_then(|s| serde_json::from_str(&s).ok())
 }
 
-/// 保存指定窗口的状态
+/// 保存指定窗口的状态（对端程序运行时跳过，避免跨进程覆盖）
 #[tauri::command]
 pub fn save_window_state(scope: String, state: WindowState) {
+    if lock::check_other_session(StartupMode::current()).is_err() {
+        return;
+    }
     if let Ok(json) = serde_json::to_string(&state) {
         db::set_setting(&format!("window_state_{}", scope), &json);
     }
@@ -624,9 +740,12 @@ pub fn get_theme() -> String {
     db::get_setting("theme").unwrap_or_else(|| "light".to_string())
 }
 
-/// 保存主题设置
+/// 保存主题设置（对端程序运行时跳过，避免跨进程覆盖）
 #[tauri::command]
 pub fn save_theme(theme: String) {
+    if lock::check_other_session(StartupMode::current()).is_err() {
+        return;
+    }
     db::set_setting("theme", &theme);
 }
 
@@ -638,9 +757,12 @@ pub fn get_display_format() -> String {
     db::get_setting("display_format").unwrap_or_else(|| "number_name".to_string())
 }
 
-/// 保存结果显示格式
+/// 保存结果显示格式（对端程序运行时跳过，避免跨进程覆盖）
 #[tauri::command]
 pub fn save_display_format(format: String) {
+    if lock::check_other_session(StartupMode::current()).is_err() {
+        return;
+    }
     db::set_setting("display_format", &format);
 }
 
@@ -686,9 +808,9 @@ pub fn get_recent_records_with_time(
 const AUTOSTART_REG_KEY: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run";
 const AUTOSTART_VALUE_NAME: &str = "NumberSelector";
 
-/// 检查开机自启是否已启用
+/// 检查开机自启是否已启用（reg.exe 子进程较慢，async 化避免阻塞 UI）
 #[tauri::command]
-pub fn is_autostart_enabled() -> bool {
+pub async fn is_autostart_enabled() -> bool {
     let exe = match std::env::current_exe() {
         Ok(e) => e,
         Err(_) => return false,
@@ -712,7 +834,7 @@ pub fn is_autostart_enabled() -> bool {
 
 /// 启用开机自启（写入注册表 Run 键）
 #[tauri::command]
-pub fn enable_autostart() -> Result<(), String> {
+pub async fn enable_autostart() -> Result<(), String> {
     let exe = std::env::current_exe()
         .map_err(|e| format!("无法获取程序路径: {}", e))?;
     let value = format!("\"{}\"", exe.display());
@@ -746,7 +868,21 @@ pub fn enable_autostart() -> Result<(), String> {
 
 /// 禁用开机自启
 #[tauri::command]
-pub fn disable_autostart() -> Result<(), String> {
+pub async fn disable_autostart() -> Result<(), String> {
+    // 先查询键是否存在再删除：中文系统 reg.exe 错误输出是 GBK 编码，
+    // 无法可靠解析「找不到」，直接按 exit code 判断
+    let mut query = std::process::Command::new("reg");
+    query.args(["query", AUTOSTART_REG_KEY, "/v", AUTOSTART_VALUE_NAME]);
+    #[cfg(windows)]
+    query.creation_flags(CREATE_NO_WINDOW);
+    let exists = query
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    if !exists {
+        return Ok(());
+    }
+
     let mut cmd = std::process::Command::new("reg");
     cmd.args([
         "delete",
@@ -762,11 +898,10 @@ pub fn disable_autostart() -> Result<(), String> {
         .map_err(|e| format!("取消自启动失败: {}", e))?;
 
     if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        // 键值不存在算成功
-        if !stderr.contains("unable to find") && !stderr.contains("找不到") {
-            return Err(format!("取消自启动失败: {}", stderr));
-        }
+        return Err(format!(
+            "取消自启动失败: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ));
     }
     Ok(())
 }
@@ -791,22 +926,26 @@ fn spawn_new_instance_and_exit(arg: &str, clean_temp: bool) -> Result<(), String
     let exe = std::env::current_exe()
         .map_err(|e| format!("无法获取程序路径: {}", e))?;
 
-    // 释放当前锁：删除锁文件以允许新实例启动
-    let lock_file = crate::config::data_dir().join(current.lock_file_name());
-    let _ = std::fs::remove_file(&lock_file);
-
     if clean_temp {
         // 清理可能存在的旧临时文件，避免干扰启动模式检测
         let temp_path = std::env::temp_dir().join("ns_startup_settings.txt");
         let _ = std::fs::remove_file(&temp_path);
     }
 
-    std::process::Command::new(&exe)
-        .arg(arg)
-        .spawn()
-        .map_err(|e| format!("启动失败: {}", e))?;
+    // 释放 OS 级会话锁（不删锁文件），新实例即可 acquire；
+    // 不能直接删锁文件——spawn 失败时本进程仍需持锁运行，删了会留下双开窗口
+    lock::release_current();
 
-    std::process::exit(0);
+    match std::process::Command::new(&exe).arg(arg).spawn() {
+        Ok(_) => std::process::exit(0),
+        Err(e) => {
+            // 启动失败：重新拿回会话锁，当前进程继续安全运行
+            if let Ok(l) = lock::SessionLock::acquire(current) {
+                l.store();
+            }
+            Err(format!("启动失败: {}", e))
+        }
+    }
 }
 
 // ─────────── 数据目录切换 ───────────

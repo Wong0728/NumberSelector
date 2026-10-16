@@ -1,5 +1,16 @@
 import { invoke } from "@tauri-apps/api/core";
 
+/** 给 invoke 加超时兜底：后端命令不返回时前端状态（如 drawing）不能永久卡死 */
+export function withTimeout<T>(p: Promise<T>, ms: number, what: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const t = window.setTimeout(() => reject(new Error(`${what}超时（${ms}ms 未返回）`)), ms);
+    p.then(
+      (v) => { window.clearTimeout(t); resolve(v); },
+      (e) => { window.clearTimeout(t); reject(e); },
+    );
+  });
+}
+
 export interface ModesPayload {
   front: string[];
   back: string[];
@@ -113,6 +124,8 @@ export const api = {
   getModes: () => invoke<ModesPayload>("get_modes"),
   getMemoryModes: () => invoke<string[]>("get_memory_modes"),
   getStudents: () => invoke<Student[]>("get_students"),
+  /** 数据版本号：名单/内存模式/参数范围等被修改时递增，用于跨进程数据刷新 */
+  getDataVersion: () => invoke<number>("get_data_version"),
   getUsed: (back_mode: string) => invoke<number[]>("get_used", { backMode: back_mode }),
   isInForbidRange: () => invoke<boolean>("is_in_forbid_range"),
   startDraw: (args: {

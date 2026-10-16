@@ -33,6 +33,9 @@ impl StartupMode {
     fn from_temp_file() -> Self {
         let temp_path = std::env::temp_dir().join("ns_startup_settings.txt");
         if let Ok(content) = std::fs::read_to_string(&temp_path) {
+            // 一次性语义：读完即删。本程序自身不写该文件（仅旧版启动器写），
+            // 不删的话一个遗留文件会让之后所有无参启动（含开机自启）都进设置模式
+            let _ = std::fs::remove_file(&temp_path);
             let trimmed = content.trim().trim_start_matches('\u{FEFF}').trim();
             if trimmed == "settings" {
                 return StartupMode::Settings;

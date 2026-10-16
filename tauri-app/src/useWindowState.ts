@@ -1,6 +1,7 @@
 import { useEffect, useRef } from "react";
 import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { api } from "./api";
+import { logEvent } from "./logger";
 
 /**
  * 窗口状态记忆 Hook：监听 resize 并防抖保存到后端。
@@ -19,6 +20,7 @@ export function useWindowState(key: "draw" | "settings", onMinimize?: () => void
     let disposed = false;
     let lastMinimized = false;
     let saveTimer: number | null = null;
+    let lastStateSig = "";
 
     (async () => {
       try {
@@ -38,6 +40,12 @@ export function useWindowState(key: "draw" | "settings", onMinimize?: () => void
             saveTimer = window.setTimeout(async () => {
               try {
                 const maximized = await win.isMaximized();
+                // 窗口状态变化留痕：与「最大化后点不动」类现场问题建立时间线关联
+                const stateSig = `min=${minimized} max=${maximized}`;
+                if (stateSig !== lastStateSig) {
+                  lastStateSig = stateSig;
+                  logEvent("window", `[${key}] 窗口状态变化：minimized=${minimized} maximized=${maximized}`);
+                }
                 const factor = await win.scaleFactor().catch(() => 1);
                 const size = await win.outerSize();
                 const pos = await win.outerPosition();

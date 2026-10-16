@@ -1,5 +1,6 @@
 import { useEffect, useCallback, useRef, useState, useLayoutEffect } from "react";
 import { useEscToClose } from "./useEscToClose";
+import { logEvent, logDebug } from "./logger";
 
 export interface GuideStep {
   /** 要高亮的元素的 data-tour 值。不提供则居中显示气泡 */
@@ -62,6 +63,12 @@ export default function Guide({ steps, currentStep, onStepChange, onComplete }: 
   const skipMaskRef = useRef<HTMLDivElement>(null);
 
   useEscToClose(!!skipWarning, () => setSkipWarning(null), skipMaskRef);
+
+  // 引导遮罩会拦截全屏点击，是「界面点不动」的排查重点，全程留痕
+  useEffect(() => {
+    logDebug("guide", `引导显示，共 ${steps.length} 步`);
+    return () => logEvent("guide", "引导遮罩移除");
+  }, [steps.length]);
 
   function scrollTarget(el: Element, block: ScrollLogicalPosition) {
     adjustingRef.current = true;
@@ -311,12 +318,18 @@ export default function Guide({ steps, currentStep, onStepChange, onComplete }: 
     }
   }
 
+  // 步骤变化留痕
+  useEffect(() => {
+    logDebug("guide", `引导步骤 ${stepIdx + 1}/${steps.length}：${step?.title ?? ""}`);
+  }, [stepIdx, step?.title, steps.length]);
+
   function handlePrimary() {
     if (step?.onPrimary) {
       step.onPrimary();
       return;
     }
     if (isLast) {
+      logEvent("guide", "引导完成（点击完成按钮）");
       onComplete();
     } else {
       goTo(stepIdx + 1);
@@ -339,6 +352,7 @@ export default function Guide({ steps, currentStep, onStepChange, onComplete }: 
 
   function finishGuide() {
     setSkipWarning(null);
+    logEvent("guide", "引导完成（跳过收尾）");
     onComplete();
   }
 

@@ -47,6 +47,9 @@ struct FloatState {
     thread: Option<thread::JoinHandle<()>>,
     /// 窗口线程已退出的信号
     finished: bool,
+    /// 超时取消标志：置位后窗口线程若稍后才创建成功，须立即自毁退出，
+    /// 否则 close_float_window 的 join() 会永久阻塞（窗口线程停在消息循环里）
+    cancelled: bool,
 }
 
 impl Default for FloatState {
@@ -55,6 +58,7 @@ impl Default for FloatState {
             hwnd: None,
             thread: None,
             finished: false,
+            cancelled: false,
         }
     }
 }
@@ -130,6 +134,11 @@ pub fn show_float_window() -> Result<(), String> {
     let handle = thread::spawn(|| unsafe {
         if let Err(e) = create_and_run() {
             eprintln!("[float_window] create failed: {}", e);
+            // 提前失败：标记结束并唤醒等待方，避免 show_float_window 白等满 5 秒。
+            // Err 只发生在 hwnd 尚未保存的创建阶段，此处不会覆盖已成功状态。
+            let mut state = FLOAT_STATE.lock();
+            state.finished = true;
+            FLOAT_CONDVAR.notify_all();
         }
     });
     state.thread = Some(handle);
@@ -143,7 +152,8 @@ pub fn show_float_window() -> Result<(), String> {
         return Err("悬浮窗线程异常退出".to_string());
     }
 
-    // 超时：清理线程
+    // 超时：置取消标志并回收线程；窗口线程若稍后才创建成功会看到标志并自毁
+    state.cancelled = true;
     drop(state);
     close_float_window();
     Err("悬浮窗创建超时".to_string())
@@ -247,9 +257,17 @@ unsafe fn create_and_run() -> Result<(), String> {
     // 设置整体不透明度（layered window）
     let _ = SetLayeredWindowAttributes(hwnd, COLORREF(0), 240, LWA_ALPHA);
 
-    // 保存 HWND 并通知等待方
+    // 保存 HWND 并通知等待方；若等待方已超时取消，立即自毁退出，避免 join() 永久阻塞
     {
         let mut state = FLOAT_STATE.lock();
+        if state.cancelled {
+            drop(state);
+            let _ = DestroyWindow(hwnd); // WM_DESTROY 同步清理 GWLP_USERDATA/GDI 并 PostQuitMessage
+            let mut state = FLOAT_STATE.lock();
+            state.finished = true;
+            FLOAT_CONDVAR.notify_all();
+            return Ok(());
+        }
         state.hwnd = Some(hwnd.0 as isize);
         state.finished = false;
     }
@@ -259,7 +277,12 @@ unsafe fn create_and_run() -> Result<(), String> {
 
     // 消息循环
     let mut msg = MSG::default();
-    while GetMessageW(&mut msg, None, 0, 0).into() {
+    loop {
+        // GetMessageW 返回 0=WM_QUIT 正常退出，-1=出错；-1 会被 as bool 判为 true 造成忙等死循环
+        let r = GetMessageW(&mut msg, None, 0, 0);
+        if r.0 <= 0 {
+            break;
+        }
         let _ = TranslateMessage(&msg);
         DispatchMessageW(&msg);
     }

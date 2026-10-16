@@ -19,10 +19,15 @@ body,
   background: var(--bg);
   color: var(--text);
   overscroll-behavior: none;
+  /* 触控屏：只保留平移滚动，禁用双击缩放/捏合缩放，
+     避免「放到最大」后布局错位、点击落点与视觉位置不一致 */
+  touch-action: pan-x pan-y;
 }
 
 button {
   font-family: inherit;
+  /* 按钮上禁用双击缩放，消除触屏点击延迟与误触缩放 */
+  touch-action: manipulation;
 }
 
 /* ───── 主题（亮色，简约黑白） ───── */
@@ -290,11 +295,26 @@ button {
   align-items: center;
   justify-content: center;
 }
-.chip:hover:not(:disabled) {
-  background: #ececef;
-  color: var(--text);
+/* 触屏点按后 :hover 会残留在最后一个元素上；触屏（.touch-pointer）不启用未选中 chip 的 hover 灰底。
+   :where() 让门控不增加特异度，保持对 .chip.selected:hover 等规则的优先级关系不变 */
+@media (hover: hover) {
+  :where(.app:not(.touch-pointer)) .chip:hover:not(:disabled) {
+    background: #ececef;
+    color: var(--text);
+  }
+  /* 锁定 chip 的 accent 悬停同样受触屏门控：残留 hover 会让人误以为解锁了 */
+  :where(.app:not(.touch-pointer)) .chip.locked:hover:not(:disabled) {
+    border-color: var(--accent);
+    color: var(--accent);
+  }
 }
 .chip.selected {
+  background: var(--accent);
+  color: var(--accent-text);
+  border-color: var(--accent);
+}
+/* 选中态必须压过 :hover（触屏残留 hover 时仍显示为已选中，避免误以为没选上） */
+.chip.selected:hover:not(:disabled) {
   background: var(--accent);
   color: var(--accent-text);
   border-color: var(--accent);
@@ -303,7 +323,15 @@ button {
   background: var(--boy);
   border-color: var(--boy);
 }
+.chip.boy.selected:hover:not(:disabled) {
+  background: var(--boy);
+  border-color: var(--boy);
+}
 .chip.girl.selected {
+  background: var(--girl);
+  border-color: var(--girl);
+}
+.chip.girl.selected:hover:not(:disabled) {
   background: var(--girl);
   border-color: var(--girl);
 }
@@ -316,9 +344,12 @@ button {
   border-color: var(--text-hint);
   color: var(--text-hint);
 }
-.chip.locked:hover:not(:disabled) {
-  border-color: var(--accent);
-  color: var(--accent);
+/* 锁定 chip 的 accent 悬停见上方触屏门控块 */
+/* 选中与锁定同时命中时以锁定为准，避免「彩底 + 灰虚线边 + 灰字」的混合外观 */
+.chip.selected.locked,
+.chip.selected.locked:hover:not(:disabled) {
+  background: var(--bg-secondary);
+  color: var(--text-hint);
 }
 
 /* ───── 输入 ───── */
@@ -395,10 +426,12 @@ button {
   justify-content: center;
   gap: 10px;
   min-height: 0;
+  /* 数字过高的极端窗口下裁掉溢出，避免盖住上方按钮吃掉点击 */
+  overflow: hidden;
 }
 
 .result-number {
-  font-size: clamp(160px, 28vw, 260px);
+  font-size: clamp(120px, min(28vw, 34vh), 260px);
   font-weight: 800;
   line-height: 1;
   font-family: "Inter", "Segoe UI", system-ui, sans-serif;
@@ -452,6 +485,8 @@ button {
   box-shadow: var(--shadow-lg);
   z-index: 1000;
   animation: toast-in 0.2s ease-out;
+  /* Toast 纯信息展示，即使因定时器节流残留也不允许挡住底层点击 */
+  pointer-events: none;
 }
 @keyframes toast-in {
   from {

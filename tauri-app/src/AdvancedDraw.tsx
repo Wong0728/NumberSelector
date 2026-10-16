@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
-import { api, AdvancedDrawResult, SeatDirection, Student } from "./api";
+import { api, AdvancedDrawResult, SeatDirection, Student, withTimeout } from "./api";
 import { useEscToClose } from "./useEscToClose";
 
 // ── 常量 ──
@@ -179,13 +179,23 @@ export default function AdvancedDraw({ students, onClose, showToast, askYesNo, s
   // ── 持久模式下加载已抽座位 ──
   useEffect(() => {
     if (!seatmap) return;
+    let cancelled = false;
     (async () => {
       try {
         const backMode = getSaveBackMode();
         const isMem = await api.getMemoryModes();
-        if (isMem.includes(backMode)) return; // 内存模式不加载
+        if (cancelled) return;
+        if (isMem.includes(backMode)) {
+          // 内存模式不加载历史记录，必须清掉上一模式残留的高亮
+          setDrawnHighlighted([]);
+          return;
+        }
         const used = await api.getUsed(backMode);
-        if (!used.length) return;
+        if (cancelled) return;
+        if (!used.length) {
+          setDrawnHighlighted([]);
+          return;
+        }
         const usedSet = new Set(used);
         const highlighted: string[] = [];
         for (const [key, info] of Object.entries(seatmap.seats)) {
@@ -201,6 +211,7 @@ export default function AdvancedDraw({ students, onClose, showToast, askYesNo, s
         console.error("加载已抽座位失败:", e);
       }
     })();
+    return () => { cancelled = true; };
   }, [seatmap, saveMode, nameToNumber]);
 
   // ── 导入座位表 ──
@@ -236,13 +247,11 @@ export default function AdvancedDraw({ students, onClose, showToast, askYesNo, s
   }
 
   // ── 重新导入 ──
+  // 不预先清空：先让用户选中新文件，导入成功后由 handleImport 覆盖状态；
+  // 若用户取消或解析失败，原座位表原样保留，避免数据被白白清掉
   async function handleReimport() {
-    const yes = await askYesNo("重新导入", "确定要重新导入座位表吗？\n当前数据将被清除。");
+    const yes = await askYesNo("重新导入", "确定要重新导入座位表吗？\n当前数据将被新文件覆盖。");
     if (!yes) return;
-    setSeatmap(null);
-    setManualSelected(new Set());
-    setDrawnHighlighted([]);
-    await api.saveSeatmap("");
     await handleImport();
   }
 
@@ -601,16 +610,21 @@ export default function AdvancedDraw({ students, onClose, showToast, askYesNo, s
 
     try {
       const selected = tv === "manual" ? Array.from(manualSelected).sort() : Array.from(rangeSelected);
-      const result = await api.advancedDrawV2({
-        back_mode: backMode,
-        draw_type: tv,
-        rule: rv === "抽一组" ? "pick_group" : "per_group_n",
-        qty,
-        selected,
-        boy_enabled: boyEnabled,
-        girl_enabled: girlEnabled,
-        save: saveEnabled,
-      });
+      // 超时兜底：后端命令若 15 秒不返回，不能让 drawing 永久卡死（与主抽号同策略）
+      const result = await withTimeout(
+        api.advancedDrawV2({
+          back_mode: backMode,
+          draw_type: tv,
+          rule: rv === "抽一组" ? "pick_group" : "per_group_n",
+          qty,
+          selected,
+          boy_enabled: boyEnabled,
+          girl_enabled: girlEnabled,
+          save: saveEnabled,
+        }),
+        15000,
+        "高级抽号请求",
+      );
 
       if (result.all_used || result.picked.length === 0) {
         showToast("该范围内所有人已抽完", "warning");

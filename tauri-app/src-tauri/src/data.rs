@@ -89,12 +89,9 @@ fn load_memory_modes_raw() -> HashSet<String> {
                 set.insert(t.to_string());
             }
         }
-        if set.is_empty() {
-            db::set_setting("memory_modes", &DEFAULT_MEMORY_MODES.join(","));
-            default_set
-        } else {
-            set
-        }
+        // 键存在即以保存值为准：空集合是合法状态（用户主动关闭全部内存模式），
+        // 只有键完全缺失才初始化默认值。Mode5 由 load_memory_modes 强制补回。
+        set
     } else {
         db::set_setting("memory_modes", &DEFAULT_MEMORY_MODES.join(","));
         default_set
@@ -133,15 +130,23 @@ pub fn load_students() -> Vec<Student> {
             "students_girl"
         };
         if let Some(json) = db::get_setting(key) {
-            if let Ok(records) =
-                serde_json::from_str::<Vec<crate::db::StudentRecord>>(&json)
-            {
-                for r in records {
-                    out.push(Student {
-                        number: r.number,
-                        name: r.name,
-                        gender: r.gender,
-                    });
+            match serde_json::from_str::<Vec<crate::db::StudentRecord>>(&json) {
+                Ok(records) => {
+                    for r in records {
+                        out.push(Student {
+                            number: r.number,
+                            name: r.name,
+                            gender: r.gender,
+                        });
+                    }
+                }
+                // 名单 JSON 损坏时静默变空名单会让性别过滤抽出「幽灵号码」，必须留痕
+                Err(e) => {
+                    crate::logging::log_with_level(
+                        "error",
+                        "data",
+                        &format!("名单数据解析失败 key={}：{}（按空名单处理）", key, e),
+                    );
                 }
             }
         }
@@ -237,7 +242,8 @@ pub fn load_time_ranges() -> Vec<(u32, u32, u32, u32)> {
                 }
             }
         }
-        if bad || out.is_empty() {
+        // 只有格式损坏（bad）才回退默认；空列表是合法状态（用户删除全部时段 = 全天可抽号）
+        if bad {
             persist_default_ranges(&default_ranges);
             default_ranges
         } else {

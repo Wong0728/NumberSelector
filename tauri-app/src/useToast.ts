@@ -1,5 +1,6 @@
 import { useRef, useState, useCallback, useEffect } from "react";
 import type { ToastState, ToastType } from "./ui";
+import { logDebug } from "./logger";
 
 /** Toast Hook：自动管理定时清除与卸载时清理 */
 export function useToast() {
@@ -10,7 +11,11 @@ export function useToast() {
     (msg: string, type: ToastType = "info", duration = 2500) => {
       if (toastTimer.current) window.clearTimeout(toastTimer.current);
       setToast({ msg, type, id: Date.now() });
-      toastTimer.current = window.setTimeout(() => setToast(null), duration);
+      logDebug("toast", `显示 toast[${type}] ${duration}ms：${msg}`);
+      toastTimer.current = window.setTimeout(() => {
+        logDebug("toast", `toast 自动消失：${msg}`);
+        setToast(null);
+      }, duration);
     },
     []
   );

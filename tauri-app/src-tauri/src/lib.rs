@@ -7,6 +7,7 @@ mod db;
 mod draw;
 mod float_window;
 mod lock;
+mod logging;
 mod settings;
 mod startup;
 mod webview2;
@@ -20,9 +21,14 @@ pub fn run() -> Result<(), String> {
     // 都没有时弹出原生引导（下载官方安装引导器 / 提示放置固定版本运行时）。
     webview2::ensure_runtime();
 
+    // Chromium「原生窗口遮挡检测」误判的规避（触控一体机上页面被误判 hidden 导致
+    // 定时器节流/触摸无响应）改由 tauri.conf.json 的 additionalBrowserArgs 配置：
+    // 一个 flag 写全 wry 默认三项 + CalculateNativeWinOcclusion，避免环境变量
+    // 追加语义产生重复 --disable-features 开关（Chromium 同名开关后者胜）。
+
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
-        .setup(|app| {
+        .setup(move |app| {
             // 数据目录：由引导配置（NumberSelector.config.json）决定；
             // 默认便携（程序侧），可切换为 %APPDATA% 或自定义绝对路径。
             let app_data_fallback = app.path().app_data_dir()
@@ -56,6 +62,16 @@ pub fn run() -> Result<(), String> {
                 mode = startup::StartupMode::Settings;
             }
             startup::StartupMode::set(mode);
+            logging::log_event(
+                "startup",
+                &format!(
+                    "程序启动 version={} mode={:?} data_dir={} exe={:?}",
+                    env!("CARGO_PKG_VERSION"),
+                    mode,
+                    config::data_dir().display(),
+                    std::env::current_exe().ok()
+                ),
+            );
 
             // 启动时按设置自动清理过期记录（0 表示不清理）
             let expire_days = db::get_setting("record_expire_days")
@@ -70,8 +86,12 @@ pub fn run() -> Result<(), String> {
 
             // 获取本会话锁，防止同类型程序多开；存入全局静态以便切换视图时切换锁。
             let session_lock = lock::SessionLock::acquire(mode)
-                .map_err(|e| format!("程序启动失败: {}", e))?;
+                .map_err(|e| {
+                    logging::log_event("startup", &format!("获取会话锁失败: {}", e));
+                    format!("程序启动失败: {}", e)
+                })?;
             session_lock.store();
+            logging::log_event("startup", "启动完成（会话锁已获取）");
 
             // 注册悬浮窗点击回调：关闭悬浮窗 + 智能恢复窗口
             // 注意：close_float_window 由 WM_APP_CLICK 自处理，回调只负责窗口恢复
@@ -111,7 +131,36 @@ pub fn run() -> Result<(), String> {
                         let _ = main_window.maximize();
                     } else if ws.width > 0 && ws.height > 0 {
                         let _ = main_window.set_size(LogicalSize::new(ws.width, ws.height));
-                        let _ = main_window.set_position(LogicalPosition::new(ws.x, ws.y));
+                        // 恢复前校验位置可见：外接显示器拔掉后记忆坐标可能在屏幕外，
+                        // 用户会看到「程序启动了但没有窗口」
+                        let visible_on_monitor = main_window
+                            .available_monitors()
+                            .map(|monitors| {
+                                monitors.iter().any(|m| {
+                                    let sf = m.scale_factor();
+                                    let (mx, my) = (
+                                        m.position().x as f64 / sf,
+                                        m.position().y as f64 / sf,
+                                    );
+                                    let (mw, mh) = (
+                                        m.size().width as f64 / sf,
+                                        m.size().height as f64 / sf,
+                                    );
+                                    let (wx, wy) = (ws.x as f64, ws.y as f64);
+                                    // 窗口至少部分落入该显示器逻辑区域
+                                    wx < mx + mw
+                                        && wx + ws.width as f64 > mx
+                                        && wy < my + mh
+                                        && wy + ws.height as f64 > my
+                                })
+                            })
+                            .unwrap_or(true); // 查询失败时不干预，保持原行为
+                        if visible_on_monitor {
+                            let _ =
+                                main_window.set_position(LogicalPosition::new(ws.x, ws.y));
+                        } else {
+                            let _ = main_window.center();
+                        }
                     }
                 }
                 let _ = main_window.show();
@@ -120,9 +169,11 @@ pub fn run() -> Result<(), String> {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            log_event,
             get_modes,
             get_memory_modes,
             get_students,
+            get_data_version,
             get_used,
             is_in_forbid_range,
             start_draw,

@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { WebviewWindow, getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { api, ModesPayload, Student, NumberLimits, QuantityLimits } from "./api";
@@ -13,12 +13,20 @@ import { useDialog } from "./useDialog";
 import { Toast } from "./Toast";
 import { YesNoDialog } from "./Dialog";
 import { useEscToClose } from "./useEscToClose";
+import { logEvent, logDebug } from "./logger";
+import { installDiagnostics } from "./diagnostics";
+import { withTimeout } from "./api";
 
 const MODE5_BACK = "Mode5";
 
 // ── 路由 ──
 export default function App() {
   const search = window.location.search;
+
+  // 全局诊断（点击命中 / 可见性 / 定时器心跳 / 未捕获异常）→ app.log
+  useEffect(() => {
+    installDiagnostics();
+  }, []);
 
   // 高级抽号窗口
   if (search.includes("view=advanced")) {
@@ -83,6 +91,13 @@ function MainApp() {
 
   const [inBreak, setInBreak] = useState(false);
   const [verified, setVerified] = useState(false);
+  const [verifyingUsb, setVerifyingUsb] = useState(false);
+  // 触屏点按后 :hover 会残留在最后一个元素上，跟踪指针类型，触屏时关掉 hover 灰底
+  const [touchPointer, setTouchPointer] = useState(false);
+  const trackPointer = (e: ReactPointerEvent) => {
+    const touch = e.pointerType !== "mouse";
+    setTouchPointer((prev) => (prev === touch ? prev : touch));
+  };
   // 禁用时段内免 U 盘验证可用的模式（back 名称）
   const [breakAllow, setBreakAllow] = useState<string[]>(["Mode5"]);
   const [usbVerifyOpen, setUsbVerifyOpen] = useState(false);
@@ -115,6 +130,8 @@ function MainApp() {
   const [drawGuideStep, setDrawGuideStep] = useState(0);
 
   const animTimers = useRef<number[]>([]);
+  // 防止 handleStart 在 React 状态更新延迟期间（如按住 Enter 键 repeat）被重复调用
+  const drawingRef = useRef(false);
 
   // USB 验证模态 Esc 关闭
   const usbVerifyMaskRef = useRef<HTMLDivElement>(null);
@@ -166,21 +183,69 @@ function MainApp() {
         setDisplayFormat(
           df === "number" || df === "name" || df === "number_name" ? df : "number_name"
         );
+        logDebug(
+          "init",
+          `初始化完成：模式=${m.front.length + 1} 学生=${st.length}(男${st.filter((s) => s.gender === "boy").length}/女${st.filter((s) => s.gender === "girl").length}) 禁用时段=${ib} firstRunDone=${frd} 显示格式=${df}`,
+        );
       } catch (e) {
-        if (!cancelled) showToast(`初始化失败: ${e}`, "error");
+        if (!cancelled) {
+          logEvent("init", `初始化失败: ${e}`);
+          showToast(`初始化失败: ${e}`, "error");
+        }
       }
     })();
 
+    let pollFailStreak = 0;
+    let pollBusy = false;
+    // 上次见到的数据版本号：设置端（独立进程）改名单/参数后版本号变化，据此重拉数据
+    let lastDataVersion: number | null = null;
     const poll = window.setInterval(async () => {
+      if (pollBusy) return; // 上一轮未完成时跳过，避免请求逐秒堆积
+      pollBusy = true;
       try {
-        const [ib, sessionVerified] = await Promise.all([
+        const [ib, sessionVerified, version] = await Promise.all([
           api.isInForbidRange(),
           api.isUsbSessionVerified(),
+          api.getDataVersion().catch(() => null),
         ]);
         if (cancelled) return;
+        if (pollFailStreak > 0) {
+          logEvent("poll", `状态轮询恢复（此前连续失败 ${pollFailStreak} 次）`);
+          pollFailStreak = 0;
+        }
         setInBreak(ib);
         setVerified(sessionVerified);
-      } catch {}
+
+        if (version !== null && lastDataVersion !== null && version !== lastDataVersion) {
+          // 设置端修改了名单/内存模式/参数范围/模式名，重新拉取
+          logEvent("poll", `检测到数据版本变化 ${lastDataVersion} → ${version}，重新加载数据`);
+          try {
+            const [m, mem, st, nl, ql] = await Promise.all([
+              api.getModes(),
+              api.getMemoryModes(),
+              api.getStudents(),
+              api.getNumberLimits(),
+              api.getQuantityLimits(),
+            ]);
+            if (cancelled) return;
+            setModes(m);
+            setMemoryModes(new Set(mem));
+            setStudents(st);
+            setNumberLimits(nl);
+            setQuantityLimits(ql);
+          } catch (e) {
+            logEvent("poll", `数据重载失败: ${e}`, "warn");
+          }
+        }
+        if (version !== null) lastDataVersion = version;
+      } catch (e) {
+        pollFailStreak++;
+        if (pollFailStreak === 1 || pollFailStreak % 30 === 0) {
+          logEvent("poll", `状态轮询连续失败 ${pollFailStreak} 次：${e}`, "warn");
+        }
+      } finally {
+        pollBusy = false;
+      }
     }, 1000);
     return () => {
       cancelled = true;
@@ -190,14 +255,20 @@ function MainApp() {
   }, []);
 
   // 监听主窗口最小化 → 显示悬浮窗，并保存窗口状态
-  useWindowState("draw", () => { invoke("main_minimize_to_float"); });
+  useWindowState("draw", () => {
+    invoke("main_minimize_to_float").catch((e) => {
+      console.warn("[float] main_minimize_to_float failed:", e);
+    });
+  });
 
   // 处于禁用时段且未验证时，若当前选中的非免验证模式应被自动取消
   useEffect(() => {
     if (inBreak && !verified && backMode && !breakAllow.includes(backMode)) {
+      logEvent("lock", `进入禁用时段且未验证U盘，自动取消模式选择: ${backMode}`);
+      showToast("已进入禁用时段，模式选择已取消（验证U盘后可重新选择）", "warning");
       setBackMode(null);
     }
-  }, [inBreak, verified, backMode, breakAllow]);
+  }, [inBreak, verified, backMode, breakAllow, showToast]);
 
   // 点击右下角「更多」菜单外部或按 Esc 关闭
   useEffect(() => {
@@ -234,6 +305,7 @@ function MainApp() {
   }, [modes, breakAllow]);
 
   function handleModeClick(back: string) {
+    logDebug("ui", `点击模式 ${back}（当前选中=${backMode ?? "无"} drawing=${drawing} 锁定=${isModeLocked(back)}）`);
     if (drawing) return;
     if (isModeLocked(back)) {
       setUsbVerifyOpen(true);
@@ -243,6 +315,7 @@ function MainApp() {
   }
 
   function toggleGender(g: "boy" | "girl") {
+    logDebug("ui", `点击性别 ${g}（当前=${gender ?? "无"} drawing=${drawing}）`);
     if (drawing) return;
     if (g === "boy" && boysCount === 0) return;
     if (g === "girl" && girlsCount === 0) return;
@@ -315,7 +388,7 @@ function MainApp() {
         primaryLabel: "留在抽号",
         onPrimary: () => {
           setFirstRunDone(true);
-          api.setFirstRunDone("draw");
+          api.setFirstRunDone("draw").catch(() => {});
         },
         action: {
           label: "打开设置程序",
@@ -395,9 +468,23 @@ function MainApp() {
     animTimers.current = [];
   }
 
+  /** 统一的 drawing 复位出口：每次复位都留痕，便于判断界面禁用时 drawing 的真实状态 */
+  function stopDrawing(reason: string) {
+    logDebug("draw", `复位 drawing：${reason}`);
+    drawingRef.current = false;
+    setDrawing(false);
+  }
+
   // ── 抽号主逻辑 ──
   async function handleStart() {
-    if (!backMode || drawing) return;
+    // 入口留痕：若日志有 click 但没有本行，说明点击被 disabled/遮罩吞掉；
+    // 若本行后紧跟复位日志，说明流程正常结束。排查「点不动」问题的关键分叉点。
+    logDebug(
+      "draw",
+      `开始抽号触发：backMode=${backMode} drawing=${drawing} canStart=${canStart} max=${maxNum} qty=${qty}`,
+    );
+    if (!backMode || drawing || drawingRef.current) return;
+    drawingRef.current = true;
     const v = validate();
     if (!v.ok) {
       showToast(v.err, "error");
@@ -405,58 +492,95 @@ function MainApp() {
     }
 
     setDrawing(true);
-    const params = { back_mode: backMode, max_num: v.max, qty: v.q, gender, save: true };
+    logEvent("draw", `抽号开始 mode=${backMode} max=${v.max} qty=${v.q} gender=${gender ?? "无"}`);
 
-    const doDraw = async () => {
-      try {
-        return await api.startDraw(params);
-      } catch (e: any) {
-        showToast(typeof e === "string" ? e : `抽号失败: ${e}`, "error");
-        return null;
-      }
-    };
+    try {
+      const params = { back_mode: backMode, max_num: v.max, qty: v.q, gender, save: true };
 
-    let result = await doDraw();
-    if (!result) { setDrawing(false); return; }
+      const doDraw = async () => {
+        try {
+          // 超时兜底：后端命令若 15 秒不返回，不能让 drawing 永久卡死
+          return await withTimeout(api.startDraw(params), 15000, "抽号请求");
+        } catch (e: any) {
+          logEvent("draw", `抽号失败 mode=${backMode}: ${e}`);
+          showToast(typeof e === "string" ? e : `抽号失败: ${e}`, "error");
+          return null;
+        }
+      };
 
-    if (result.all_used) {
-      const yes = await askYesNo("提示", "所有号码已抽完，是否清空记录重新开始？");
-      if (!yes) { setDrawing(false); return; }
-      try {
-        await api.clearRecord(backMode);
-      } catch (e: any) {
-        showToast(`清空记录失败: ${e}`, "error");
-        setDrawing(false);
-        return;
-      }
-      result = await doDraw();
-      if (!result) { setDrawing(false); return; }
+      let result = await doDraw();
+      if (!result) { stopDrawing("抽号请求失败"); return; }
+
       if (result.all_used) {
-        showToast(
-          gender ? `该性别(${gender === "boy" ? "男生" : "女生"})下没有可用号码` : "没有可用号码",
-          "error",
-        );
-        setDrawing(false);
-        return;
+        const yes = await askYesNo("提示", "所有号码已抽完，是否清空记录重新开始？");
+        if (!yes) { stopDrawing("号码抽完且用户取消清空"); return; }
+        try {
+          await api.clearRecord(backMode);
+        } catch (e: any) {
+          showToast(`清空记录失败: ${e}`, "error");
+          stopDrawing("清空记录失败");
+          return;
+        }
+        result = await doDraw();
+        if (!result) { stopDrawing("清空后重新抽号失败"); return; }
+        if (result.all_used) {
+          showToast(
+            gender ? `该性别(${gender === "boy" ? "男生" : "女生"})下没有可用号码` : "没有可用号码",
+            "error",
+          );
+          stopDrawing("清空后仍无可用号码");
+          return;
+        }
       }
-    }
 
-    if (result.message) showToast(result.message, "info");
-    runAnimation(result.picked, result.display_picked ?? result.picked, result.animation_numbers ?? []);
+      if (result.message) showToast(result.message, "info");
+      logEvent("draw", `抽号完成 mode=${backMode} picked=${result.picked.join(",")} actual=${result.actual_qty}`);
+      runAnimation(result.picked, result.display_picked ?? result.picked, result.animation_numbers ?? []);
+    } catch (e) {
+      // 兜底：任何未预期异常都不能让 drawing 卡死（否则整个界面禁用，只能重启）
+      logEvent("draw", `抽号异常 mode=${backMode}: ${e}`, "error");
+      showToast(`抽号异常: ${e}`, "error");
+      clearAnimTimers();
+      stopDrawing("抽号流程未预期异常");
+    }
   }
 
   function runAnimation(picked: number[], displayPicked: number[], animationNumbers: number[]) {
     setDrawing(true);
     clearAnimTimers();
 
+    // 空结果防御：直接复位，不进入动画
+    if (picked.length === 0) {
+      stopDrawing("空结果，跳过动画");
+      return;
+    }
+
+    // 看门狗：动画收尾依赖 setTimeout 回调链，窗口最小化（悬浮窗）或被遮挡时
+    // WebView2 可能节流甚至挂起定时器，导致 drawing 永久卡死、整个界面禁用。
+    // 超时后强制复位，保证界面始终可继续抽号。
+    const expectedMs = picked.length === 1 ? 2000 : picked.length * 1000;
+    const watchdog = window.setTimeout(() => {
+      logEvent(
+        "draw",
+        `动画看门狗触发（${expectedMs}ms 未正常收尾），强制复位 drawing。hidden=${document.hidden} visibility=${document.visibilityState}`,
+        "warn",
+      );
+      clearAnimTimers();
+      if (picked.length === 1) setDisplay(picked[0]);
+      else setDisplayMulti(picked);
+      stopDrawing("看门狗强制复位");
+    }, expectedMs + 1500);
+    animTimers.current.push(watchdog);
+
     // 禁用时段未验证：直接显示结果，无动画
     if (inBreak && !verified) {
+      clearAnimTimers();
       if (picked.length === 1) {
         setDisplay(picked[0]);
       } else {
         setDisplayMulti(picked);
       }
-      setDrawing(false);
+      stopDrawing("禁用时段免动画显示");
       return;
     }
 
@@ -478,14 +602,16 @@ function MainApp() {
           const id = window.setTimeout(tick, interval);
           animTimers.current.push(id);
         } else {
+          clearAnimTimers(); // 正常收尾：清掉看门狗等残留定时器
           setDisplay(picked[0]);
-          setDrawing(false);
+          stopDrawing(`单号动画收尾（实际耗时 ${Math.round(performance.now() - start)}ms）`);
         }
       };
       tick();
     } else {
       // 多号：逐个闪现 display 号码，最终定格显示全部真实号码
       let i = 0;
+      const multiStart = performance.now();
       const showNext = () => {
         if (i < picked.length) {
           setDisplay(displayPicked[i] ?? picked[i]);
@@ -493,8 +619,9 @@ function MainApp() {
           const id = window.setTimeout(showNext, 1000);
           animTimers.current.push(id);
         } else {
+          clearAnimTimers(); // 正常收尾：清掉看门狗等残留定时器
           setDisplayMulti(picked);
-          setDrawing(false);
+          stopDrawing(`多号动画收尾（实际耗时 ${Math.round(performance.now() - multiStart)}ms）`);
         }
       };
       showNext();
@@ -527,6 +654,8 @@ function MainApp() {
   }
 
   async function handleVerifyUsbForSession() {
+    if (verifyingUsb) return;
+    setVerifyingUsb(true);
     try {
       const ok = await api.verifyUsbForSession(usbVerifyScope);
       if (ok) {
@@ -538,6 +667,8 @@ function MainApp() {
       }
     } catch (e) {
       showToast(`验证失败: ${e}`, "error");
+    } finally {
+      setVerifyingUsb(false);
     }
   }
 
@@ -564,7 +695,10 @@ function MainApp() {
     }
   }
 
+  const advWindowOpeningRef = useRef(false);
   async function openAdvancedDrawWindow() {
+    if (advWindowOpeningRef.current) return; // 双击防重入：两个并发创建会互相报「窗口已存在」
+    advWindowOpeningRef.current = true;
     try {
       // 若窗口已存在（可能被「返回主抽号」隐藏而未销毁），直接显示并聚焦，避免重复创建报错
       const existing = await WebviewWindow.getByLabel("advanced-draw");
@@ -582,13 +716,14 @@ function MainApp() {
         minHeight: 500,
         center: true,
       });
-      advWindow.once("tauri://created", () => {});
       advWindow.once("tauri://error", (e: any) => {
         const msg = e?.payload || e?.toString() || "未知错误";
         showToast(`打开窗口失败: ${msg}`, "error");
       });
     } catch (e) {
       showToast(`打开高级抽号失败: ${e}`, "error");
+    } finally {
+      advWindowOpeningRef.current = false;
     }
   }
 
@@ -612,17 +747,19 @@ function MainApp() {
 
   useEffect(() => {
     function onKey(e: KeyboardEvent) {
-      // 有弹窗时禁用快捷键
-      if (document.querySelector(".dialog-mask")) return;
+      // 有弹窗或新手引导气泡时禁用快捷键
+      if (document.querySelector(".dialog-mask") || document.querySelector(".guide-bubble")) return;
+      // 带 Ctrl/Alt/Meta 的组合键（浏览器/系统快捷键）不抢占
+      if (e.ctrlKey || e.metaKey || e.altKey) return;
       const target = e.target as HTMLElement;
       const tag = target.tagName;
-      if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") return;
+      if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT" || target.isContentEditable) return;
 
       if (e.code === "Space" || e.key === "Enter") {
         // 按钮已聚焦时让原生行为处理，避免重复触发
         const active = document.activeElement;
         if (active && active.tagName === "BUTTON") return;
-        if (canStart && !drawing) {
+        if (canStart) {
           e.preventDefault();
           handleStartRef.current();
         }
@@ -652,7 +789,11 @@ function MainApp() {
   }
 
   return (
-    <div className="app">
+    <div
+      className={`app${touchPointer ? " touch-pointer" : ""}`}
+      onPointerDown={trackPointer}
+      onPointerMove={trackPointer}
+    >
       {/* 顶栏：左 记录公示，右 高级抽号 */}
       <div className="topbar">
         <div style={{ display: "flex", gap: 10 }}>
@@ -828,8 +969,9 @@ function MainApp() {
               <button
                 className="dialog-btn primary"
                 onClick={handleVerifyUsbForSession}
+                disabled={verifyingUsb}
               >
-                验证U盘
+                {verifyingUsb ? "验证中…" : "验证U盘"}
               </button>
             </div>
           </div>
@@ -932,7 +1074,7 @@ function MainApp() {
           onStepChange={setDrawGuideStep}
           onComplete={() => {
             setFirstRunDone(true);
-            api.setFirstRunDone("draw");
+            api.setFirstRunDone("draw").catch(() => {});
           }}
         />
       )}

@@ -69,6 +69,14 @@ impl SessionLock {
     }
 }
 
+/// 释放当前进程持有的会话锁（不删除锁文件）。
+/// 供重启/切换程序前调用：释放 OS 级文件锁后新实例才能 acquire；
+/// 若随后 spawn 失败，当前进程可重新 acquire 恢复互斥保护。
+pub fn release_current() {
+    let mut g = SESSION_LOCK.lock();
+    let _ = g.take();
+}
+
 /// 检查对方程序是否正在运行。若对方锁为残留锁（进程已退出）则自动清理。
 pub fn check_other_session(mode: StartupMode) -> Result<(), String> {
     let path = lock_path(mode.other_lock_file_name());
@@ -91,10 +99,16 @@ pub fn check_other_session(mode: StartupMode) -> Result<(), String> {
             drop(file);
             Ok(())
         }
-        Err(_) => Err(format!(
-            "{}正在操作数据库，请稍后再试",
-            mode.other_display_name()
-        )),
+        Err(_) => {
+            crate::logging::log_event(
+                "lock",
+                &format!("检测到{}正在运行，操作被拒绝", mode.other_display_name()),
+            );
+            Err(format!(
+                "{}正在操作数据库，请稍后再试",
+                mode.other_display_name()
+            ))
+        }
     }
 }
 

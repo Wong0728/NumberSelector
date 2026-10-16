@@ -1119,10 +1119,19 @@ mod tests {
 
 const SENSITIVE_SETTINGS: &[&str] = &["usb_salt", "usb_authorized"];
 
+/// 归「名单」项管理的键：名单数据（students_boy/girl）与名单集（rosters/active_roster）。
+/// 不进设置导出/导入，防止「只导设置」静默覆盖名单
+const ROSTER_SETTING_KEYS: &[&str] = &["students_boy", "students_girl", "rosters", "active_roster"];
+
 #[derive(Serialize, Deserialize)]
 struct StudentsBundle {
     boy: Vec<db::StudentRecord>,
     girl: Vec<db::StudentRecord>,
+    /// 名单集快照 + 活跃名单名（v2 备份才有；旧文件缺省 None，走迁移逻辑）
+    #[serde(default)]
+    rosters: Option<RosterMap>,
+    #[serde(default)]
+    active_roster: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -1172,6 +1181,11 @@ pub fn export_data(items: &[String], path: &str) -> Result<(), String> {
             if SENSITIVE_SETTINGS.contains(&k.as_str()) {
                 continue;
             }
+            // 名单/名单集归「名单」项管理，不进设置项——
+            // 否则只勾「设置」导入也会把当前名单静默覆盖成备份里的旧名单
+            if ROSTER_SETTING_KEYS.contains(&k.as_str()) {
+                continue;
+            }
             m.insert(k, serde_json::Value::String(v));
         }
         bundle.settings = Some(serde_json::Value::Object(m));
@@ -1180,6 +1194,10 @@ pub fn export_data(items: &[String], path: &str) -> Result<(), String> {
         bundle.students = Some(StudentsBundle {
             boy: load_students_setting("students_boy"),
             girl: load_students_setting("students_girl"),
+            rosters: Some(load_rosters()),
+            active_roster: Some(
+                db::get_setting("active_roster").unwrap_or_else(|| "默认名单".to_string()),
+            ),
         });
     }
     if items.iter().any(|s| s == "seatmap") {
@@ -1314,6 +1332,10 @@ pub fn import_data_apply(items: &[String], path: &str) -> Result<(), String> {
                 if SENSITIVE_SETTINGS.contains(&k.as_str()) {
                     continue;
                 }
+                // 旧版备份的设置项里混有名单数据，导入时跳过（新版文件已不导出这些键）
+                if ROSTER_SETTING_KEYS.contains(&k.as_str()) {
+                    continue;
+                }
                 let val = match v {
                     serde_json::Value::String(s) => s.clone(),
                     other => other.to_string(),
@@ -1327,6 +1349,17 @@ pub fn import_data_apply(items: &[String], path: &str) -> Result<(), String> {
     }
     if items.iter().any(|s| s == "students") {
         if let Some(s) = &bundle.students {
+            // v2 备份带名单集快照：先恢复名单集与活跃名单，再同步当前名单
+            if let Some(rosters) = &s.rosters {
+                if !rosters.is_empty() {
+                    save_rosters(rosters);
+                    if let Some(active) = &s.active_roster {
+                        if rosters.contains_key(active) {
+                            db::set_setting("active_roster", active);
+                        }
+                    }
+                }
+            }
             let boy_json =
                 serde_json::to_string(&s.boy).map_err(|e| format!("序列化失败: {}", e))?;
             let girl_json =

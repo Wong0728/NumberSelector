@@ -211,7 +211,12 @@ pub fn set_bootstrap_data_dir(kind: DataDirKind, custom_path: Option<&Path>) -> 
     let json = serde_json::json!({ "data_dir": value });
     let json_str = serde_json::to_string_pretty(&json)
         .map_err(|e| format!("序列化配置失败: {}", e))?;
-    std::fs::write(&config_path, json_str)
+    // 原子写入：先写临时文件再 rename。直接覆写时写一半崩溃/断电会产生损坏的
+    // JSON，下次启动解析失败回退默认目录，用户会看到「数据全部丢失」
+    let tmp_path = config_path.with_extension("json.tmp");
+    std::fs::write(&tmp_path, json_str)
+        .map_err(|e| format!("写入引导配置失败: {}", e))?;
+    std::fs::rename(&tmp_path, &config_path)
         .map_err(|e| format!("写入引导配置失败: {}", e))?;
     Ok(())
 }

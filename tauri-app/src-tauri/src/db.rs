@@ -131,10 +131,28 @@ pub fn get_setting(key: &str) -> Option<String> {
 
 pub fn set_setting(key: &str, value: &str) {
     let conn = settings_conn().lock();
-    let _ = conn.execute(
+    if let Err(e) = conn.execute(
         "INSERT OR REPLACE INTO settings (key, value) VALUES (?1, ?2)",
         params![key, value],
-    );
+    ) {
+        crate::logging::log_event("db", &format!("写入设置失败 key={}: {}", key, e));
+    }
+}
+
+// ───── 跨进程数据版本号 ─────
+
+/// 读取数据版本号（无记录时为 0）
+pub fn get_data_version() -> u64 {
+    get_setting("data_version")
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(0)
+}
+
+/// 数据版本号 +1：名单/内存模式/参数范围/模式名/座位表/记录等被修改时调用，
+/// 抽号端（独立进程）轮询该值，变化时重新拉取数据
+pub fn bump_data_version() {
+    let v = get_data_version().wrapping_add(1);
+    set_setting("data_version", &v.to_string());
 }
 
 /// 为指定模式添加抽号记录（事务批量写入，保证原子性）
@@ -142,15 +160,23 @@ pub fn add_records(mode: &str, numbers: &[i32]) {
     let conn = records_conn().lock();
     let tx = match conn.unchecked_transaction() {
         Ok(t) => t,
-        Err(e) => { eprintln!("[db] begin tx 失败: {}", e); return; }
+        Err(e) => {
+            eprintln!("[db] begin tx 失败: {}", e);
+            crate::logging::log_event("db", &format!("add_records 开启事务失败 mode={}: {}", mode, e));
+            return;
+        }
     };
     for n in numbers {
-        let _ = tx.execute(
+        if let Err(e) = tx.execute(
             "INSERT INTO draw_records (mode, number) VALUES (?1, ?2)",
             params![mode, n],
-        );
+        ) {
+            crate::logging::log_event("db", &format!("写入记录失败 mode={} number={}: {}", mode, n, e));
+        }
     }
-    let _ = tx.commit();
+    if let Err(e) = tx.commit() {
+        crate::logging::log_event("db", &format!("add_records 提交事务失败 mode={}: {}", mode, e));
+    }
 }
 
 /// 获取指定模式的所有已抽号码
@@ -160,6 +186,7 @@ pub fn get_used_for(mode: &str) -> Vec<i32> {
         Ok(s) => s,
         Err(e) => {
             eprintln!("[db] prepare get_used 失败: {}", e);
+            crate::logging::log_event("db", &format!("get_used 查询失败 mode={}: {}", mode, e));
             return Vec::new();
         }
     };
@@ -173,7 +200,9 @@ pub fn get_used_for(mode: &str) -> Vec<i32> {
 /// 清空指定模式的所有记录
 pub fn clear_records(mode: &str) {
     let conn = records_conn().lock();
-    let _ = conn.execute("DELETE FROM draw_records WHERE mode = ?1", params![mode]);
+    if let Err(e) = conn.execute("DELETE FROM draw_records WHERE mode = ?1", params![mode]) {
+        crate::logging::log_event("db", &format!("清空记录失败 mode={}: {}", mode, e));
+    }
 }
 
 /// 获取所有设置键值对（用于数据导出）
@@ -265,24 +294,33 @@ pub fn migrate_old_data(old_dir: &std::path::Path, new_dir: &std::path::Path) ->
     if old_records.is_file() && !new_records.is_file() {
         std::fs::copy(&old_records, &new_records)
             .map_err(|e| format!("迁移 records.db 失败: {}", e))?;
+        // WAL 模式下未 checkpoint 的数据在 -wal 里，只拷 .db 会丢最近写入
+        for suffix in ["-wal", "-shm"] {
+            let src = old_dir.join(format!("records.db{}", suffix));
+            if src.is_file() {
+                let _ = std::fs::copy(&src, new_dir.join(format!("records.db{}", suffix)));
+            }
+        }
     }
     if old_settings.is_file() && !new_settings.is_file() {
         std::fs::copy(&old_settings, &new_settings)
             .map_err(|e| format!("迁移 settings.db 失败: {}", e))?;
+        for suffix in ["-wal", "-shm"] {
+            let src = old_dir.join(format!("settings.db{}", suffix));
+            if src.is_file() {
+                let _ = std::fs::copy(&src, new_dir.join(format!("settings.db{}", suffix)));
+            }
+        }
     }
 
     Ok(())
 }
 
 /// 从旧版 ConfigEngine/Students/*.txt 迁移学生数据到 settings.db
+/// 用一次性标记键判断是否已迁移；不能拿「名单为空」当标记——
+/// 用户创建空名单并切换后 students_boy/girl 为 "[]"，会被误判为未迁移而灌回旧数据
 fn migrate_students_from_files() {
-    let boys_empty = get_setting("students_boy")
-        .map(|s| s == "[]" || s.is_empty())
-        .unwrap_or(true);
-    let girls_empty = get_setting("students_girl")
-        .map(|s| s == "[]" || s.is_empty())
-        .unwrap_or(true);
-    if !boys_empty || !girls_empty {
+    if get_setting("students_migrated_v1").is_some() {
         return;
     }
 
@@ -290,15 +328,29 @@ fn migrate_students_from_files() {
     if let Some(ce) = config_engine {
         let boys = read_student_file(&ce.join("Students/boys.txt"), "boy");
         let girls = read_student_file(&ce.join("Students/girls.txt"), "girl");
-        if let Ok(json) = serde_json::to_string(&boys) {
-            set_setting("students_boy", &json);
+        // 仅当旧目录确实有学生数据时才落库，空目录不覆盖现有名单
+        let has_data = !boys.is_empty() || !girls.is_empty();
+        if has_data {
+            let boys_empty = get_setting("students_boy")
+                .map(|s| s == "[]" || s.is_empty())
+                .unwrap_or(true);
+            let girls_empty = get_setting("students_girl")
+                .map(|s| s == "[]" || s.is_empty())
+                .unwrap_or(true);
+            if boys_empty && girls_empty {
+                if let Ok(json) = serde_json::to_string(&boys) {
+                    set_setting("students_boy", &json);
+                }
+                if let Ok(json) = serde_json::to_string(&girls) {
+                    set_setting("students_girl", &json);
+                }
+            }
+            migrate_time_ranges_file(&ce);
+            migrate_modes_file(&ce);
         }
-        if let Ok(json) = serde_json::to_string(&girls) {
-            set_setting("students_girl", &json);
-        }
-        migrate_time_ranges_file(&ce);
-        migrate_modes_file(&ce);
     }
+    // 无论是否找到旧目录都打标记，避免每次启动重复探测
+    set_setting("students_migrated_v1", "1");
 }
 
 fn migrate_time_ranges_file(ce: &std::path::Path) {

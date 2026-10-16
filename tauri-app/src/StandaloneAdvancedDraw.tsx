@@ -17,7 +17,7 @@ export default function StandaloneAdvancedDraw() {
   const { toast, showToast } = useToast();
   const { dialog, setDialog, askYesNo } = useDialog();
 
-  // 加载学生数据
+  // 加载学生数据；并轮询数据版本号，设置端（独立进程）改名单后自动刷新
   useEffect(() => {
     let cancelled = false;
     (async () => {
@@ -31,17 +31,38 @@ export default function StandaloneAdvancedDraw() {
         if (!cancelled) setStudentsLoaded(true);
       }
     })();
-    return () => { cancelled = true; };
+
+    let lastVersion: number | null = null;
+    const timer = window.setInterval(async () => {
+      try {
+        const v = await api.getDataVersion();
+        if (cancelled) return;
+        if (lastVersion !== null && v !== lastVersion) {
+          const st = await api.getStudents();
+          if (cancelled) return;
+          setStudents(st);
+        }
+        lastVersion = v;
+      } catch {
+        // 轮询失败静默跳过，下一轮重试
+      }
+    }, 2000);
+
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
   }, []);
 
   // 窗口最小化：拦截 → 隐藏当前高级窗口并显示悬浮窗（点击悬浮窗时统一打开主抽号）
   useEffect(() => {
     let unlistenResize: (() => void) | null = null;
     let processing = false;
+    let disposed = false;
     (async () => {
       try {
         const currentWin = getCurrentWebviewWindow();
-        unlistenResize = await currentWin.onResized(async () => {
+        const fn = await currentWin.onResized(async () => {
           if (processing) return;
           processing = true;
           try {
@@ -71,9 +92,16 @@ export default function StandaloneAdvancedDraw() {
             processing = false;
           }
         });
+        // 注册完成前组件已卸载：立即解绑，避免泄漏
+        if (disposed) {
+          fn();
+          return;
+        }
+        unlistenResize = fn;
       } catch (e) { console.warn("[advanced] resize listener setup failed:", e); }
     })();
     return () => {
+      disposed = true;
       if (unlistenResize) unlistenResize();
     };
   }, []);
