@@ -1,6 +1,6 @@
 [package]
 name = "number_selector"
-version = "0.1.0"
+version = "1.0.0"
 description = "NumberSelector - 智能抽号系统"
 authors = ["WongJY"]
 edition = "2021"
